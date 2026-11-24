@@ -127,7 +127,7 @@ pub fn summarize(width: u32, height: u32, rgba: &[u8]) -> Summary {
     let mut pixels = 0u64;
     let mut present = [false; (256 / LEVEL) as usize];
     let mut top_bucket = 0u8;
-    for p in rgba.chunks_exact(4) {
+    for p in rgba.as_chunks::<4>().0 {
         pixels += 1;
         let c = [p[0], p[1], p[2]];
         if c.iter().any(|&v| v != 0) {
@@ -173,7 +173,7 @@ pub fn write_ppm(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::
     }
     let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
     out.reserve(width as usize * height as usize * 3);
-    for p in rgba.chunks_exact(4) {
+    for p in rgba.as_chunks::<4>().0 {
         out.extend_from_slice(&p[..3]);
     }
     // A PPM path beside PNGs is expected to end in .ppm; nothing reads it.
@@ -200,7 +200,7 @@ mod tests {
     fn a_drawn_frame_is_not_black() {
         // Two pixels black then two white, in one row.
         let mut rgba = vec![0u8; 4 * 2 * 4];
-        for p in rgba.chunks_exact_mut(4).skip(4) {
+        for p in rgba.as_chunks_mut::<4>().0.iter_mut().skip(4) {
             p[..3].copy_from_slice(&[255, 255, 255]);
         }
         let s = summarize(4, 2, &rgba);
@@ -232,7 +232,7 @@ mod tests {
         let rgba = pack(Pixels::Rgba8, 1, 1, 4, &[10, 20, 30, 255]);
         assert_eq!(rgba, [10, 20, 30, 255]);
         // R10G10B10A2: full red, half green, no blue.
-        let v: u32 = 1023 | (511 << 10) | (0 << 20);
+        let v: u32 = 1023 | (511 << 10);
         let ten = pack(Pixels::Rgb10a2, 1, 1, 4, &v.to_le_bytes());
         assert_eq!(ten, [255, 127, 0, 255]);
     }
