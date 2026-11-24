@@ -518,6 +518,99 @@ pub(crate) fn recent_levels() -> Vec<u8> {
     levels.iter().copied().collect()
 }
 
+/// Frames listed in `VICTORY_READBACK` (comma-separated): each is copied
+/// back at its present, written as a PPM, and summarised in one log line.
+pub(crate) fn readback_listed(n: u64) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let list = std::env::var("VICTORY_READBACK").unwrap_or_default();
+        list.split(',')
+            .filter_map(|f| f.trim().parse().ok())
+            .collect()
+    })
+    .contains(&n)
+}
+
+/// Where read-back frames go: `VICTORY_READBACK_DIR`, else
+/// `~/victory-work/captures`.
+fn readback_folder() -> PathBuf {
+    static FOLDER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    FOLDER
+        .get_or_init(|| {
+            if let Some(dir) = std::env::var_os("VICTORY_READBACK_DIR") {
+                return PathBuf::from(dir);
+            }
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+            match home {
+                Some(home) => PathBuf::from(home).join("victory-work").join("captures"),
+                None => PathBuf::from("captures"),
+            }
+        })
+        .clone()
+}
+
+/// Saves a frame read back by [`read_back`] as `frame-<n>.ppm` and logs one
+/// line that says whether it is black: size, non-zero pixels, per-channel
+/// min/max/mean, and how many 16-wide luminance levels hold a pixel.
+pub(crate) fn readback(
+    frame: u64,
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
+    use crate::frame_stats::{pack, summarize, write_ppm, Pixels};
+    let f = footprint.Footprint;
+    let Some(pixels) = Pixels::of(f.Format.0 as u32) else {
+        tracing::warn!(
+            frame,
+            format = f.Format.0,
+            "frame not read back: not an 8-bit or 10-bit colour target"
+        );
+        return;
+    };
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished (every submission is waited for); the
+    // mapping spans the footprint's rows.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            tracing::warn!(frame, "frame not read back: the copy did not map");
+            return;
+        }
+    }
+    let pitch = f.RowPitch as usize;
+    // SAFETY: the mapping spans `pitch` bytes a row for `f.Height` rows.
+    let rgba = unsafe {
+        let len = pitch * f.Height as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        pack(pixels, f.Width, f.Height, pitch, rows)
+    };
+    // SAFETY: the bytes were copied out above; the mapping is ours alone.
+    unsafe { buffer.Unmap(0, None) };
+    let summary = summarize(f.Width, f.Height, &rgba);
+    let path = readback_folder().join(format!("frame-{frame}.ppm"));
+    let saved = write_ppm(&path, f.Width, f.Height, &rgba);
+    let mean = summary.mean.map(|m| (m * 10.0).round() / 10.0);
+    tracing::info!(
+        frame,
+        width = summary.width,
+        height = summary.height,
+        format = pixels.name(),
+        ppm = %path.display(),
+        saved = saved.is_ok(),
+        total = summary.pixels,
+        nonzero = summary.nonzero,
+        min = ?summary.min,
+        max = ?summary.max,
+        mean = ?mean,
+        buckets = summary.buckets,
+        top_bucket = summary.top_bucket,
+        black = summary.black,
+        "frame read back: is it black?"
+    );
+    if let Err(e) = saved {
+        tracing::warn!(frame, error = %e, path = %path.display(), "frame not saved");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
