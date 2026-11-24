@@ -262,6 +262,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         }
     }
     remove_trivial_phis(&mut blocks, values);
+    forward_parked_sgprs(&mut blocks, values);
     Ok(Program {
         wave64,
         vgprs,
@@ -631,6 +632,130 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
         for inst in &mut block.insts {
             for (_, v) in &mut inst.reads {
                 *v = find(&replaced, *v);
+            }
+        }
+    }
+}
+
+/// SGPRs parked in a VGPR lane: a program short of SGPRs moves some into
+/// single lanes of a spare VGPR (`v_writelane_b32 vN, sX, lane`) and fetches
+/// them back (`v_readlane_b32 sY, vN, lane`), both regardless of EXEC. The
+/// value fetched is the one parked, so its readers read that instead: a
+/// parked lane mask (a saved EXEC) stays a mask, each lane's bit again
+/// (Leonida tools/lane_masks.py, "Parked masks"). Only constant lanes, and
+/// joins that park the same value on every path, are followed.
+fn forward_parked_sgprs(blocks: &mut [Block], values: u32) {
+    let n = values as usize;
+    let mut defs: Vec<Option<(usize, usize)>> = vec![None; n];
+    let mut phis: Vec<Option<(usize, usize)>> = vec![None; n];
+    for (b, block) in blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            phis[phi.value.0 as usize] = Some((b, i));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                defs[v.0 as usize] = Some((b, i));
+            }
+        }
+    }
+    let lane = |op: Operand| match op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    };
+    // What lane `at` of VGPR value `v` holds: `Ok(None)` for a join being
+    // resolved, `Err` if not a parked SGPR value.
+    fn parked(
+        blocks: &[Block],
+        defs: &[Option<(usize, usize)>],
+        phis: &[Option<(usize, usize)>],
+        lane: &dyn Fn(Operand) -> Option<u32>,
+        v: Value,
+        at: u32,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Value>, ()> {
+        if let Some((b, i)) = phis[v.0 as usize] {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &blocks[b].phis[i].args {
+                if let Some(m) = parked(blocks, defs, phis, lane, a, at, seen)? {
+                    if found.is_some_and(|f| f != m) {
+                        return Err(());
+                    }
+                    found = Some(m);
+                }
+            }
+            return Ok(found);
+        }
+        let (b, i) = defs[v.0 as usize].ok_or(())?;
+        let inst = &blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, l]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        if lane(*l).ok_or(())? != at {
+            let old = inst.read(Reg::V(reg)).ok_or(())?;
+            return parked(blocks, defs, phis, lane, old, at, seen);
+        }
+        match *value {
+            Operand::Scalar { code, .. } if code != gfx10::NULL => {
+                inst.read(Reg::S(code)).map(Some).ok_or(())
+            }
+            _ => Err(()),
+        }
+    }
+    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+    for block in blocks.iter() {
+        for inst in &block.insts {
+            let Fields::Valu(r) = &inst.fields else {
+                continue;
+            };
+            if inst.name() != "v_readlane_b32" {
+                continue;
+            }
+            let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, l]) =
+                (r.dst, &r.src[..])
+            else {
+                continue;
+            };
+            let (Some(at), Some(src), Some(dst)) =
+                (lane(*l), inst.read(Reg::V(*reg)), inst.write(Reg::S(code)))
+            else {
+                continue;
+            };
+            if let Ok(Some(x)) = parked(blocks, &defs, &phis, &lane, src, at, &mut Vec::new()) {
+                replaced[dst.0 as usize] = x;
+            }
+        }
+    }
+    let find = |mut v: Value| {
+        // A value parked again after a fetch: follow the chain.
+        for _ in 0..n {
+            let r = replaced[v.0 as usize];
+            if r == v {
+                break;
+            }
+            v = r;
+        }
+        v
+    };
+    for block in blocks {
+        for phi in &mut block.phis {
+            for a in &mut phi.args {
+                *a = find(*a);
+            }
+        }
+        for inst in &mut block.insts {
+            for (_, v) in &mut inst.reads {
+                *v = find(*v);
             }
         }
     }
@@ -1041,6 +1166,36 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn sgprs_parked_in_vgpr_lanes_come_back_as_themselves() {
+        let p = build_words(
+            &[
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD761_0000,
+                0x0001_0A08, // v_writelane_b32 v0, s8, 5
+                0xD760_0002,
+                0x0001_0700, // v_readlane_b32 s2, v0, 3
+                0xD760_0003,
+                0x0001_0B00, // v_readlane_b32 s3, v0, 5
+                0xD760_0004,
+                0x0001_0F00, // v_readlane_b32 s4, v0, 7 (never parked)
+                0x8705_0302, // s_and_b32 s5, s2, s3
+                0x8706_0404, // s_and_b32 s6, s4, s4
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let insts = &p.blocks[0].insts;
+        let and = insts.iter().find(|i| i.write(Reg::S(5)).is_some()).unwrap();
+        assert_eq!(and.read(Reg::S(2)), Some(input(&p, Reg::S(9))));
+        assert_eq!(and.read(Reg::S(3)), Some(input(&p, Reg::S(8))));
+        // A lane nothing parked a value in keeps the fetch's own value.
+        let fetch = insts.iter().find(|i| i.write(Reg::S(4)).is_some()).unwrap();
+        let and = insts.iter().find(|i| i.write(Reg::S(6)).is_some()).unwrap();
+        assert_eq!(and.read(Reg::S(4)), fetch.write(Reg::S(4)));
     }
 
     #[test]
