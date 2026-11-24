@@ -128,6 +128,36 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// Image address words, with `a16`, that keep a whole VGPR before the
+/// packed coordinates: the texel offset, the bias (its f16 in the low
+/// half), the z-compare and the gradients (`spatial` per direction; f32 on
+/// GFX10 without G16). LLVM's GFX10 layout (`getAddrSizeMIMGOp`),
+/// GPU-checked by Leonida (docs/design.md, "Packed sample addresses").
+fn whole_address_words(name: &str, spatial: usize) -> usize {
+    let Some(mods) = name
+        .strip_prefix("image_sample")
+        .or_else(|| name.strip_prefix("image_gather4"))
+    else {
+        return 0;
+    };
+    let has = |m: &str| mods.split('_').any(|s| s == m);
+    usize::from(has("o"))
+        + usize::from(has("b"))
+        + usize::from(has("c"))
+        + if has("d") { 2 * spatial } else { 0 }
+}
+
+/// Address component `k`'s VGPR (index into the address registers) and,
+/// for a packed one, its half (0 low, 1 high): with `a16`, components from
+/// `whole` on are two per VGPR.
+fn address_slot(a16: bool, whole: usize, k: usize) -> (usize, Option<u32>) {
+    if a16 && k >= whole {
+        (whole + (k - whole) / 2, Some((k - whole) as u32 % 2))
+    } else {
+        (k, None)
+    }
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -5243,9 +5273,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -5274,18 +5301,28 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
+        // With a16, two 16-bit components per VGPR, low half first, from
+        // the coordinates on: the extra arguments before them (texel
+        // offset, bias, z-compare) and the gradients keep a VGPR each, a
+        // bias with its f16 in the low half (LLVM's GFX10 address layout,
+        // `getAddrSizeMIMGOp`; GPU-checked by Leonida, docs/design.md
+        // "Packed sample addresses").
+        let spatial = coords - usize::from(kind == 6 || kind == 7);
+        let whole = if *a16 {
+            whole_address_words(name, spatial)
+        } else {
+            0
+        };
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let r = *regs
-                .get(if *a16 { k / 2 } else { k })
-                .ok_or("an image address")?;
+            let (r, half) = address_slot(*a16, whole, k);
+            let r = *regs.get(r).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !*a16 {
+            let Some(half) = half else {
                 return Ok(x);
-            }
+            };
             let c = l.cur;
-            let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
+            let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
@@ -5580,8 +5617,16 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let bias = addr_val(self, usize::from(offset_word))?;
+                    let bias = if *a16 {
+                        let low = self.s.m.i32(0xFFFF);
+                        let bias = self.s.m.bin(c, Bin::And, bias, low);
+                        let f = self.s.t.f32;
+                        self.s
+                            .op(c, "legacyF16ToF32", Attr::ReadNone, f, 131, &[bias])
+                    } else {
+                        self.as_float(bias)
+                    };
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
@@ -5595,11 +5640,12 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
+                    // Gradients are f32 words, a16 or not.
                     for k in 0..spatial {
                         let x = addr_val(self, first + k)?;
-                        g[k] = to_float(self, x);
+                        g[k] = self.as_float(x);
                         let y = addr_val(self, first + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                        g[3 + k] = self.as_float(y);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -6761,6 +6807,38 @@ mod tests {
         // The mask itself stored as data is exact here (compute has the
         // console's wave).
         lowers_with_table(&program(false)).unwrap();
+    }
+
+    #[test]
+    fn sixteen_bit_addresses_pack_only_the_coordinates() {
+        use super::{address_slot, whole_address_words};
+        // Without a16 every component is a VGPR.
+        assert_eq!(address_slot(false, 0, 2), (2, None));
+        // 2D image_sample_b a16: bias in v0 (f16, low half), x and y in v1
+        // (the layout llvm-mc gives `v[0:1]`).
+        let w = whole_address_words("image_sample_b", 2);
+        assert_eq!(w, 1);
+        let slots: Vec<_> = (0..3).map(|k| address_slot(true, w, k)).collect();
+        assert_eq!(slots, [(0, None), (1, Some(0)), (1, Some(1))]);
+        // 2D image_sample_c_lz a16: the z-compare an f32 VGPR, then x, y.
+        let w = whole_address_words("image_sample_c_lz", 2);
+        assert_eq!((w, address_slot(true, w, 2)), (1, (1, Some(1))));
+        // 2D image_sample_c_b a16: bias, z-compare, then packed x, y
+        // (`v[0:2]`).
+        let w = whole_address_words("image_sample_c_b", 2);
+        assert_eq!((w, address_slot(true, w, 3)), (2, (2, Some(1))));
+        // 2D image_sample_d a16: four f32 gradients, then x, y in v4.
+        let w = whole_address_words("image_sample_d", 2);
+        assert_eq!(w, 4);
+        assert_eq!(address_slot(true, w, 3), (3, None));
+        assert_eq!(address_slot(true, w, 5), (4, Some(1)));
+        // 3D: six gradients.
+        assert_eq!(whole_address_words("image_sample_d", 3), 6);
+        // A texel offset keeps its dword; plain samples and loads pack all.
+        assert_eq!(whole_address_words("image_gather4_lz_o", 2), 1);
+        assert_eq!(whole_address_words("image_sample_c_b_o", 2), 3);
+        assert_eq!(whole_address_words("image_sample_l", 2), 0);
+        assert_eq!(whole_address_words("image_load", 2), 0);
     }
 
     #[test]
