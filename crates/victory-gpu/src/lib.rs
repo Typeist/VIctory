@@ -17,6 +17,8 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+mod frame_stats;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

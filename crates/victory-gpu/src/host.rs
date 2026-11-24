@@ -1719,6 +1719,10 @@ impl Host {
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = crate::capture::probe(&self.device, list, texture);
+            #[cfg(feature = "diagnostics")]
+            let readback = crate::capture::readback_listed(frame)
+                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .flatten();
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -1734,6 +1738,10 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some((buffer, footprint)) = readback {
+                crate::capture::readback(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
