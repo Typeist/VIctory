@@ -232,7 +232,10 @@ fn create_instance(path: Option<&std::path::Path>) -> Result<CreateInstance, Str
         }
         let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
             .ok_or("dxil.dll lacks DxcCreateInstance")?;
-        Ok(std::mem::transmute::<unsafe extern "system" fn() -> isize, CreateInstance>(create))
+        Ok(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            CreateInstance,
+        >(create))
     }
 }
 
