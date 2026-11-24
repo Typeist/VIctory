@@ -158,6 +158,18 @@ fn address_slot(a16: bool, whole: usize, k: usize) -> (usize, Option<u32>) {
     }
 }
 
+/// A cube face's direction, per component (x, y, z): a constant plus
+/// multiples of u = 2 s - 3 and v = 2 t - 3, the console's face
+/// coordinates s and t in [1, 2]. Faces +x, -x, +y, -y, +z, -z.
+const CUBE_FACES: [[(f32, f32, f32); 3]; 6] = [
+    [(1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, -1.0, 0.0)],
+    [(-1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)],
+    [(0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)],
+    [(0.0, 1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, -1.0)],
+    [(0.0, 1.0, 0.0), (0.0, 0.0, -1.0), (1.0, 0.0, 0.0)],
+    [(0.0, -1.0, 0.0), (0.0, 0.0, -1.0), (-1.0, 0.0, 0.0)],
+];
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -5307,7 +5319,8 @@ impl<'a> Lower<'a> {
         // bias with its f16 in the low half (LLVM's GFX10 address layout,
         // `getAddrSizeMIMGOp`; GPU-checked by Leonida, docs/design.md
         // "Packed sample addresses").
-        let spatial = coords - usize::from(kind == 6 || kind == 7);
+        // Gradients per direction: a cube's are its face's two.
+        let spatial = coords - usize::from(matches!(kind, 5..=7));
         let whole = if *a16 {
             whole_address_words(name, spatial)
         } else {
@@ -5470,7 +5483,7 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -5540,7 +5553,11 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            let grads = if op == 63 {
+                2 * (coords - usize::from(matches!(kind, 5..=7)))
+            } else {
+                0
+            };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -5555,10 +5572,12 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            let mut cube_face = None;
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
+                cube_face = Some(cs[2]);
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
             }
@@ -5640,16 +5659,32 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    // Gradients are f32 words, a16 or not.
-                    for k in 0..spatial {
+                    // Gradients are f32 words, a16 or not; a cube's are its
+                    // face coordinates', turned into the direction's.
+                    let n = grads / 2;
+                    for k in 0..n {
                         let x = addr_val(self, first + k)?;
                         g[k] = self.as_float(x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, first + n + k)?;
                         g[3 + k] = self.as_float(y);
                     }
+                    if let Some(face) = cube_face {
+                        let dx = self.cube_gradient(g[0], g[1], face);
+                        let dy = self.cube_gradient(g[3], g[4], face);
+                        g[..3].copy_from_slice(&dx);
+                        g[3..].copy_from_slice(&dy);
+                    }
+                    // `_cl`: the level clamp, the component after the
+                    // coordinates (an f16 packed with them under a16).
+                    let clamp = if name.ends_with("_cl") {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -5801,22 +5836,46 @@ impl<'a> Lower<'a> {
         let u = self.s.m.bin(c, Bin::Sub, u, three);
         let v = self.s.m.bin(c, Bin::Mul, t, two);
         let v = self.s.m.bin(c, Bin::Sub, v, three);
+        self.cube_select(face, u, v, true)
+    }
+
+    /// The direction gradient of a cube sample's face-coordinate gradient
+    /// (`ds`, `dt`): [`Lower::cube_direction`] is linear in s and t, so its
+    /// derivative is twice the gradient along each of the face's axes,
+    /// with no part along the major axis (which the host's projection onto
+    /// the face then returns unchanged).
+    fn cube_gradient(&mut self, ds: V, dt: V, face: V) -> [V; 3] {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let u = self.s.m.bin(c, Bin::Mul, ds, two);
+        let v = self.s.m.bin(c, Bin::Mul, dt, two);
+        self.cube_select(face, u, v, false)
+    }
+
+    /// Per component, [`CUBE_FACES`]' row for `face` (an f32 face id) over
+    /// `u` and `v`; its constants with `constant`, else none.
+    fn cube_select(&mut self, face: V, u: V, v: V, constant: bool) -> [V; 3] {
+        let c = self.cur;
         let z = self.s.m.f32(0x8000_0000);
         let (nu, nv) = (
             self.s.m.bin(c, Bin::Sub, z, u),
             self.s.m.bin(c, Bin::Sub, z, v),
         );
-        let (one, mone) = (k(self, 1.0), k(self, -1.0));
         let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
-        // Per face +x, -x, +y, -y, +z, -z.
-        let table = [
-            [one, mone, u, u, u, nu],
-            [nv, nv, one, mone, nv, nv],
-            [nu, u, v, nv, one, mone],
-        ];
-        table.map(|row| {
-            let mut r = row[0];
-            for (n, &x) in row.iter().enumerate().skip(1) {
+        std::array::from_fn(|comp| {
+            let mut pick = |l: &mut Self, n: usize| {
+                let (k, a, b) = CUBE_FACES[n][comp];
+                match (a, b) {
+                    (1.0, _) => u,
+                    (-1.0, _) => nu,
+                    (_, 1.0) => v,
+                    (_, -1.0) => nv,
+                    _ => l.s.m.f32(if constant { k } else { 0.0 }.to_bits()),
+                }
+            };
+            let mut r = pick(self, 0);
+            for n in 1..6 {
+                let x = pick(self, n);
                 let kn = self.s.m.i32(n as u32);
                 let is = self.s.m.cmp(c, pred::EQ, f, kn);
                 r = self.s.m.select(c, is, x, r);
@@ -6839,6 +6898,36 @@ mod tests {
         assert_eq!(whole_address_words("image_sample_c_b_o", 2), 3);
         assert_eq!(whole_address_words("image_sample_l", 2), 0);
         assert_eq!(whole_address_words("image_load", 2), 0);
+    }
+
+    #[test]
+    fn cube_faces_point_where_the_console_samples() {
+        use super::CUBE_FACES;
+        let dir = |f: usize, s: f32, t: f32| {
+            CUBE_FACES[f].map(|(k, a, b)| k + a * (2.0 * s - 3.0) + b * (2.0 * t - 3.0))
+        };
+        // Face centres are the axes; s grows along the face's sc axis and
+        // t along -tc (the console's v_cubesc/v_cubetc for +x: -z, -y).
+        let axes = [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ];
+        for (f, axis) in axes.iter().enumerate() {
+            assert_eq!(dir(f, 1.5, 1.5), *axis, "face {f}");
+            // One axis each for s and t, both off the major axis: the
+            // gradient has no part along it.
+            let (u, v): (Vec<f32>, Vec<f32>) =
+                CUBE_FACES[f].iter().map(|&(_, a, b)| (a, b)).unzip();
+            for g in [&u, &v] {
+                assert_eq!(g.iter().filter(|x| **x != 0.0).count(), 1, "face {f}");
+                assert_eq!(g.iter().zip(axis).map(|(a, b)| a * b).sum::<f32>(), 0.0);
+            }
+        }
+        assert_eq!(dir(0, 2.0, 1.0), [1.0, 1.0, -1.0]);
     }
 
     #[test]
