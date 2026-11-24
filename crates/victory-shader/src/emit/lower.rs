@@ -3966,9 +3966,7 @@ impl<'a> Lower<'a> {
                     self.lane_bits.insert(w, carry);
                 }
                 for &(_, w) in &inst.writes {
-                    self.vals
-                        .entry(w)
-                        .or_insert(Val::Missing("a lane mask read as data"));
+                    self.vals.entry(w).or_insert(Val::Missing(LANE_MASK));
                 }
                 Ok(())
             }
@@ -5097,9 +5095,7 @@ impl<'a> Lower<'a> {
             self.lane_bits.insert(lo, r);
         }
         for &(_, w) in &inst.writes {
-            self.vals
-                .entry(w)
-                .or_insert(Val::Missing("a lane mask read as data"));
+            self.vals.entry(w).or_insert(Val::Missing(LANE_MASK));
         }
     }
 
@@ -6520,12 +6516,12 @@ impl<'a> Lower<'a> {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             // A register the console compiler reuses: a descriptor dword
-            // with no host value on some paths, data on others. Readers of
-            // the join see data only on the paths that wrote it (the
-            // others branch around them on values the structuriser cannot
-            // relate), so the descriptor's paths contribute 0.
-            // shortcut: a reader that does take the descriptor's path reads
-            // 0 instead of the descriptor's bits.
+            // with no host value, or a lane mask's, on some paths, data on
+            // others. Readers of the join see data only on the paths that
+            // wrote it (the others branch around them on values the
+            // structuriser cannot relate), so the other paths contribute 0.
+            // shortcut: a reader that does take such a path reads 0 instead
+            // of the descriptor's or mask's bits.
             let data = phi
                 .args
                 .iter()
@@ -6537,9 +6533,10 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Missing(SCALAR_DESCRIPTOR | DESCRIPTOR_BITS)), false) if data => {
-                        self.s.m.i32(0)
-                    }
+                    (
+                        Some(Val::Missing(SCALAR_DESCRIPTOR | DESCRIPTOR_BITS | LANE_MASK)),
+                        false,
+                    ) if data => self.s.m.i32(0),
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
@@ -6728,6 +6725,42 @@ mod tests {
         // The descriptor dword itself stored has no host value.
         let e = lowers_with_table(&descriptor_register_reused(false)).unwrap_err();
         assert!(e.to_string().contains("descriptor read as data"), "{e}");
+    }
+
+    #[test]
+    fn a_lane_mask_register_reused_for_data_joins_as_data() {
+        // s16 = a lane mask (wave32); on one path it is reloaded with a
+        // constant, and the join is stored.
+        let program = |reload: bool| {
+            let mut w = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+                0xF408_0302, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+                0xFA00_0010,
+                0xD4C4_0010, // v_cmp_gt_u32 s16, 0, v0
+                0x0002_0080,
+            ];
+            if reload {
+                w.extend([
+                    0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                    0xBF85_0002, // s_cbranch_scc1 -> v_mov_b32
+                    0xF420_0404, // s_buffer_load_dword s16, s[8:11], 0
+                    0xFA00_0000,
+                ]);
+            }
+            w.extend([
+                0x7E00_0210, // v_mov_b32 v0, s16
+                0xE070_0000, // buffer_store_dword v0, off, s[12:15], 0
+                0x8003_0000,
+                S_ENDPGM,
+            ]);
+            w
+        };
+        lowers_with_table(&program(true)).unwrap();
+        // The mask itself stored as data is exact here (compute has the
+        // console's wave).
+        lowers_with_table(&program(false)).unwrap();
     }
 
     #[test]
