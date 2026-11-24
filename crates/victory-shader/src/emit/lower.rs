@@ -2293,6 +2293,7 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                let why = diag_origin(why, name);
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -2317,6 +2318,22 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            if std::env::var_os("VICTORY_WHY_ORIGIN").is_some() {
+                let mut r = Vec::new();
+                for &(_, v) in &inst.writes {
+                    for blk in &self.x.p.blocks {
+                        for j in &blk.insts {
+                            if let Some(pos) = j.reads.iter().position(|x| x.1 == v) {
+                                if j.reads[pos].0 != Reg::S(EXEC) { r.push(format!("{}#{pos}", j.name())); }
+                            }
+                        }
+                        for ph in &blk.phis { if ph.args.contains(&v) { r.push("phi".into()); } }
+                    }
+                }
+                r.sort(); r.dedup();
+                let tag: &'static str = Box::leak(format!("{name} readers {}", r.join(",")).into_boxed_str());
+                return Err(diag_origin(LANE_MASK, tag));
+            }
             return Err(LANE_MASK);
         }
         if matches!(
@@ -2920,7 +2937,19 @@ impl<'a> Lower<'a> {
                 })
             });
         let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+            let mut r = Vec::new();
+            for &(_, v) in &inst.writes {
+                for blk in &self.x.p.blocks {
+                    for j in &blk.insts {
+                        if let Some(pos) = j.reads.iter().position(|x| x.1 == v) { r.push(format!("{}#{pos}", j.name())); }
+                    }
+                    for ph in &blk.phis { if ph.args.contains(&v) { r.push("phi".into()); } }
+                }
+            }
+            r.sort(); r.dedup();
+            let roles: Vec<String> = self.x.res.descriptors.iter().filter(|d| d.source.leaves().iter().any(|l| matches!(**l, Source::Loaded { load, .. } if load == site))).map(|d| format!("{:?}", d.role)).collect();
+            let tag: &'static str = Box::leak(format!("{} readers {} roles {}", inst.name(), r.join(","), roles.join(",")).into_boxed_str());
+            return Err(diag_origin("a descriptor read only as data", tag));
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -3968,9 +3997,22 @@ impl<'a> Lower<'a> {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                     _ => None,
                 };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
+                let m = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                    Some(m) => m,
+                    None => {
+                        let mut found = String::from("param/phi/none");
+                        if let Some(mv) = mask {
+                            for b2 in &self.x.p.blocks {
+                                for j in &b2.insts {
+                                    if j.writes.iter().any(|w| w.1 == mv) { found = j.name().to_string(); }
+                                }
+                                for ph in &b2.phis { if ph.value == mv { found = "phi".into(); } }
+                            }
+                        }
+                        let tag: &'static str = Box::leak(format!("mask from {found} wave64={}", self.x.native.wave64).into_boxed_str());
+                        return Err(diag_origin("a select on an untracked mask", tag));
+                    }
+                };
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -6982,4 +7024,23 @@ mod tests {
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
     }
+}
+
+/// TEMP DIAG: `VICTORY_WHY_ORIGIN=1` tags a missing value's reason with the
+/// instruction that produced it.
+fn diag_origin(why: Why, name: &str) -> Why {
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_WHY_ORIGIN").is_some()) || why.contains(" [") || why == SCALAR_DESCRIPTOR || why == DESCRIPTOR_BITS {
+        return why;
+    }
+    let s = format!("{why} [{name}]");
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if let Some(&w) = seen.get(s.as_str()) {
+        return w;
+    }
+    let w: &'static str = Box::leak(s.into_boxed_str());
+    seen.insert(w);
+    w
 }
