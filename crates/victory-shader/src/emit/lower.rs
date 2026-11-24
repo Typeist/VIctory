@@ -238,6 +238,14 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// What the dwords of a scalar buffer's descriptor (`s_buffer_load`'s
+/// source) read as numbers stop with: they have no host value.
+const SCALAR_DESCRIPTOR: Why = "a scalar buffer's descriptor read as data";
+
+/// What the dwords of a descriptor the host view cannot rebuild
+/// (addresses, formats, tiling) read as numbers stop with.
+const DESCRIPTOR_BITS: Why = "a descriptor's address or format read as data";
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -2841,7 +2849,6 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -2909,6 +2916,7 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
+            Fields::Smem { .. } => return Err(SCALAR_DESCRIPTOR),
             _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
@@ -2969,7 +2977,7 @@ impl<'a> Lower<'a> {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        self.vals.insert(v, Val::Missing(DESCRIPTOR_BITS));
                     }
                 }
             }
@@ -6511,6 +6519,17 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // A register the console compiler reuses: a descriptor dword
+            // with no host value on some paths, data on others. Readers of
+            // the join see data only on the paths that wrote it (the
+            // others branch around them on values the structuriser cannot
+            // relate), so the descriptor's paths contribute 0.
+            // shortcut: a reader that does take the descriptor's path reads
+            // 0 instead of the descriptor's bits.
+            let data = phi
+                .args
+                .iter()
+                .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -6518,6 +6537,9 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                    (Some(Val::Missing(SCALAR_DESCRIPTOR | DESCRIPTOR_BITS)), false) if data => {
+                        self.s.m.i32(0)
+                    }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
@@ -6596,6 +6618,116 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// Lowers a compute program with root constants in `s0..s3` and a
+    /// descriptor table at `s4` holding a constant buffer (dword 0) and a
+    /// raw UAV (dword 4).
+    fn lowers_with_table(words: &[u32]) -> Result<(), crate::ShaderError> {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let range = |table_offset_dwords, slot| RootParam {
+            root: RootType::Table,
+            table_offset_dwords,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot,
+        };
+        let used = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                range(0, 1),
+                range(4, 1),
+            ],
+            used: vec![used(ResourceType::Cbv, 0), used(ResourceType::Uav, 4)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    }
+
+    /// `s[8:11]` = the constant buffer's descriptor, then (`skip`: on a
+    /// branch) `s9` = a constant read through it, and `s9` stored.
+    fn descriptor_register_reused(branch: bool) -> Vec<u32> {
+        let mut w = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,
+            0xF408_0302, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xFA00_0010,
+        ];
+        if branch {
+            w.extend([
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0xBF85_0002, // s_cbranch_scc1 -> v_mov_b32
+            ]);
+        }
+        w.extend([
+            0xF420_0244, // s_buffer_load_dword s9, s[8:11], 0
+            0xFA00_0000,
+        ]);
+        if !branch {
+            // s9 read before it is reloaded: the descriptor's dword itself.
+            w.splice(5..5, [0x7E00_0209]); // v_mov_b32 v0, s9
+        } else {
+            w.push(0x7E00_0209); // v_mov_b32 v0, s9
+        }
+        w.extend([
+            0xE070_0000, // buffer_store_dword v0, off, s[12:15], 0
+            0x8003_0000,
+            S_ENDPGM,
+        ]);
+        w
+    }
+
+    #[test]
+    fn a_descriptor_register_reused_for_data_joins_as_data() {
+        // The join after the branch holds the descriptor's dword 1 on the
+        // skipping path and the loaded constant on the other: the store
+        // reads the constant (the descriptor's path gives 0).
+        lowers_with_table(&descriptor_register_reused(true)).unwrap();
+        // The descriptor dword itself stored has no host value.
+        let e = lowers_with_table(&descriptor_register_reused(false)).unwrap_err();
+        assert!(e.to_string().contains("descriptor read as data"), "{e}");
     }
 
     #[test]
