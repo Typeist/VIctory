@@ -7,6 +7,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use host::Host;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -137,6 +140,40 @@ impl Tally {
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
+    }
+}
+
+/// Host pipelines need D3D12: elsewhere `--pipelines` and `VICTORY_PAIRS`
+/// report that instead.
+#[cfg(not(windows))]
+mod host {
+    use victory_shader::emit::HostShader;
+
+    const NO_HOST: &str = "host pipelines need Windows (D3D12)";
+
+    pub struct Host;
+
+    impl Host {
+        pub fn new(_warp: bool) -> Result<Self, String> {
+            Err(NO_HOST.into())
+        }
+        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            Err(NO_HOST.into())
+        }
+        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            Err(NO_HOST.into())
+        }
+        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            Err(NO_HOST.into())
+        }
+    }
+
+    pub fn stub_ps() -> HostShader {
+        unreachable!("no host without Windows")
+    }
+
+    pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
+        Err(NO_HOST.into())
     }
 }
 

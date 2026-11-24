@@ -84,7 +84,7 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
